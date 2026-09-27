@@ -217,4 +217,25 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-data/
+data/testenv/
+testenv/
+
+# Additional project requirements
+.env.*
+!.env.example
+
+data/xbd/
+data/obstruction/
+
+checkpoints/
+runs/
+outputs/
+logs/
+
+*.pt
+*.pth
+*.ckpt
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

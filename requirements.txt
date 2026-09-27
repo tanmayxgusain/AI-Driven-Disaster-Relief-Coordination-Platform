@@ -5,3 +5,10 @@ pandas
 geopandas
 osmnx
 scikit-learn
+pytest
+Pillow
+torchvision
+shapely
+opencv-python
+python-multipart
+httpx
