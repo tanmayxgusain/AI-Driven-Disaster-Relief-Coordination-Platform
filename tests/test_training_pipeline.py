@@ -22,12 +22,19 @@ def synthetic_train_dataset(tmp_path):
     for split in ["train", "val"]:
         images_dir = tmp_path / split / "images"
         labels_dir = tmp_path / split / "labels"
+        masks_dir = tmp_path / split / "masks"
         images_dir.mkdir(parents=True)
         labels_dir.mkdir(parents=True)
+        masks_dir.mkdir(parents=True)
         
         sample_id = "test_001"
         Image.new('RGB', (1024, 1024), color='green').save(images_dir / f"{sample_id}_pre_disaster.png")
         Image.new('RGB', (1024, 1024), color='red').save(images_dir / f"{sample_id}_post_disaster.png")
+        
+        # Numeric mask
+        mask_np = np.zeros((1024, 1024), dtype=np.uint8)
+        mask_np[100:200, 100:200] = 3
+        Image.fromarray(mask_np).save(masks_dir / f"{sample_id}_post_disaster.png")
         
         wkt_poly = "POLYGON ((100 100, 200 100, 200 200, 100 200, 100 100))"
         annotation = {
@@ -141,3 +148,28 @@ def test_checkpointing(tmp_path):
     assert ckpt["epoch"] == 1
     assert ckpt["val_loss"] == 0.5
     assert "model_state_dict" in ckpt
+
+def test_cpu_smoke_run(synthetic_train_dataset, tmp_path):
+    from vision.train import train_pipeline
+    
+    config = TrainConfig(
+        dataset_root=str(synthetic_train_dataset),
+        train_split="train",
+        val_split="val",
+        max_train_samples=16,
+        max_val_samples=8,
+        batch_size=1,
+        epochs=1,
+        device="cpu",
+        num_workers=0,
+        checkpoint_dir=str(tmp_path / "checkpoints")
+    )
+    
+    model = train_pipeline(config)
+    
+    assert os.path.exists(tmp_path / "checkpoints" / "last.pt")
+    assert os.path.exists(tmp_path / "checkpoints" / "best.pt")
+    
+    # Check resume logic runs
+    model_resume = train_pipeline(config, resume_checkpoint=str(tmp_path / "checkpoints" / "last.pt"))
+    assert model_resume is not None

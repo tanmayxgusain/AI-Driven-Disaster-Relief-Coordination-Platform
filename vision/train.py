@@ -18,8 +18,14 @@ from .evaluate import evaluate_epoch
 @dataclass
 class TrainConfig:
     dataset_root: str = "data/xbd"
+    train_split: str = "tier1"
+    val_split: str = "hold"
+    max_train_samples: int = None
+    max_val_samples: int = None
+    label_source: str = "mask"
     batch_size: int = 4
     num_workers: int = 2
+    pin_memory: bool = True
     epochs: int = 10
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
@@ -28,6 +34,7 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     num_classes: int = 4
     ignore_index: int = 4
+    early_stopping_patience: int = 4
 
 def set_seed(seed):
     random.seed(seed)
@@ -39,15 +46,21 @@ def set_seed(seed):
 
 def create_dataloaders(config: TrainConfig):
     """Creates train and validation DataLoaders."""
-    train_dataset = XBDDataset(config.dataset_root, split="train", is_train=True)
-    val_dataset = XBDDataset(config.dataset_root, split="val", is_train=False)
+    train_dataset = XBDDataset(
+        config.dataset_root, split=config.train_split, is_train=True, 
+        max_samples=config.max_train_samples, label_source=config.label_source
+    )
+    val_dataset = XBDDataset(
+        config.dataset_root, split=config.val_split, is_train=False, 
+        max_samples=config.max_val_samples, label_source=config.label_source
+    )
     
     train_loader = DataLoader(
         train_dataset, 
         batch_size=config.batch_size, 
         shuffle=True, 
         num_workers=config.num_workers,
-        pin_memory=(config.device == "cuda")
+        pin_memory=config.pin_memory if config.device == "cuda" else False
     )
     
     val_loader = DataLoader(
@@ -55,7 +68,7 @@ def create_dataloaders(config: TrainConfig):
         batch_size=config.batch_size, 
         shuffle=False, 
         num_workers=config.num_workers,
-        pin_memory=(config.device == "cuda")
+        pin_memory=config.pin_memory if config.device == "cuda" else False
     )
     
     return train_loader, val_loader
@@ -65,7 +78,7 @@ def create_loss_function(config: TrainConfig):
 
 def create_optimizer_and_scheduler(model: nn.Module, config: TrainConfig):
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
     return optimizer, scheduler
 
 def save_checkpoint(model, optimizer, scheduler, epoch, train_loss, val_metrics, config, filename):
@@ -84,9 +97,9 @@ def save_checkpoint(model, optimizer, scheduler, epoch, train_loss, val_metrics,
     }
     torch.save(checkpoint, filepath)
     
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, device, scaler=None):
     """
-    Runs one epoch of training.
+    Runs one epoch of training, with optional AMP support.
     """
     model.train()
     total_loss = 0.0
@@ -99,18 +112,28 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         
         optimizer.zero_grad()
         
-        logits = model(pre_img, post_img)
-        loss = criterion(logits, mask)
-        
-        loss.backward()
-        optimizer.step()
-        
+        if scaler is not None:
+            with torch.amp.autocast(device_type=device, enabled=True):
+                logits = model(pre_img, post_img)
+                loss = criterion(logits, mask)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(pre_img, post_img)
+            loss = criterion(logits, mask)
+            loss.backward()
+            optimizer.step()
+            
         total_loss += loss.item()
         num_batches += 1
         
     return total_loss / max(1, num_batches)
 
-def train_pipeline(config: TrainConfig):
+import time
+
+def train_pipeline(config: TrainConfig, resume_checkpoint: str = None):
     """
     Main training execution function.
     """
@@ -122,21 +145,56 @@ def train_pipeline(config: TrainConfig):
     criterion = create_loss_function(config)
     optimizer, scheduler = create_optimizer_and_scheduler(model, config)
     
-    best_val_loss = float('inf')
+    scaler = torch.amp.GradScaler(device=config.device) if config.device == "cuda" else None
     
-    for epoch in range(1, config.epochs + 1):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, config.device)
+    start_epoch = 1
+    best_metric = -1.0 # using mean_iou for early stopping
+    
+    if resume_checkpoint and os.path.exists(resume_checkpoint):
+        print(f"Resuming from checkpoint: {resume_checkpoint}")
+        ckpt = torch.load(resume_checkpoint, map_location=config.device, weights_only=True)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if ckpt.get('scheduler_state_dict') and scheduler:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        start_epoch = ckpt['epoch'] + 1
+        best_metric = ckpt.get('val_metrics', {}).get("mean_iou", 0.0)
+    
+    epochs_no_improve = 0
+    
+    for epoch in range(start_epoch, config.epochs + 1):
+        epoch_start_time = time.time()
+        
+        train_start = time.time()
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, config.device, scaler)
+        train_time = time.time() - train_start
+        
+        val_start = time.time()
         val_metrics = evaluate_epoch(model, val_loader, criterion, config.device, config.num_classes, config.ignore_index)
+        val_time = time.time() - val_start
+        
+        total_time = time.time() - epoch_start_time
+        
+        print(f"Epoch {epoch}/{config.epochs} - Train Time: {train_time:.1f}s - Val Time: {val_time:.1f}s - Total: {total_time:.1f}s")
+        print(f"Train Loss: {train_loss:.4f} - Val Loss: {val_metrics['loss']:.4f} - Mean IoU: {val_metrics['mean_iou']:.4f}")
         
         val_loss = val_metrics["loss"]
+        current_metric = val_metrics["mean_iou"]
         scheduler.step(val_loss)
         
         # Save last checkpoint
-        save_checkpoint(model, optimizer, scheduler, epoch, train_loss, val_metrics, config, "last_checkpoint.pt")
+        save_checkpoint(model, optimizer, scheduler, epoch, train_loss, val_metrics, config, "last.pt")
         
         # Save best checkpoint
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_checkpoint(model, optimizer, scheduler, epoch, train_loss, val_metrics, config, "best_model.pt")
+        if current_metric > best_metric:
+            best_metric = current_metric
+            epochs_no_improve = 0
+            save_checkpoint(model, optimizer, scheduler, epoch, train_loss, val_metrics, config, "best.pt")
+        else:
+            epochs_no_improve += 1
+            
+        if config.epochs > 1 and epochs_no_improve >= config.early_stopping_patience:
+            print(f"Early stopping triggered after {epoch} epochs.")
+            break
             
     return model
