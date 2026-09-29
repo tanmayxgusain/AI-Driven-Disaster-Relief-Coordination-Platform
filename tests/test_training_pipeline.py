@@ -61,6 +61,31 @@ def test_loss_function():
     assert not torch.isnan(loss)
     assert loss.item() > 0
 
+def test_weighted_loss_function_valid():
+    config = TrainConfig(ignore_index=4, class_weights=(0.5, 1.0, 1.5, 2.0), device="cpu")
+    criterion = create_loss_function(config)
+    
+    assert isinstance(criterion, torch.nn.CrossEntropyLoss)
+    assert criterion.weight is not None
+    assert torch.allclose(criterion.weight, torch.tensor([0.5, 1.0, 1.5, 2.0], dtype=torch.float32))
+    assert criterion.ignore_index == 4
+
+def test_weighted_loss_function_invalid_length():
+    config = TrainConfig(class_weights=(1.0, 1.0, 1.0))
+    with pytest.raises(ValueError, match="exactly 4 values"):
+        create_loss_function(config)
+
+def test_weighted_loss_function_invalid_value():
+    invalid_configs = [
+        TrainConfig(class_weights=(1.0, -1.0, 1.0, 1.0)),
+        TrainConfig(class_weights=(1.0, 1.0, 0.0, 1.0)),
+        TrainConfig(class_weights=(1.0, float('nan'), 1.0, 1.0)),
+        TrainConfig(class_weights=(1.0, float('inf'), 1.0, 1.0))
+    ]
+    for config in invalid_configs:
+        with pytest.raises(ValueError, match="finite and > 0"):
+            create_loss_function(config)
+
 def test_metrics():
     # Synthetic preds and targets
     # Classes 0-3, Ignore 4
@@ -135,7 +160,7 @@ def test_checkpointing(tmp_path):
     model = SiameseUNet()
     optimizer = torch.optim.Adam(model.parameters())
     
-    config = TrainConfig(checkpoint_dir=str(tmp_path))
+    config = TrainConfig(checkpoint_dir=str(tmp_path), class_weights=(0.27, 1.0, 1.55, 1.19))
     val_metrics = {"loss": 0.5, "mean_iou": 0.8}
     
     save_checkpoint(model, optimizer, None, 1, 0.6, val_metrics, config, "test.pt")
@@ -148,6 +173,8 @@ def test_checkpointing(tmp_path):
     assert ckpt["epoch"] == 1
     assert ckpt["val_loss"] == 0.5
     assert "model_state_dict" in ckpt
+    assert "config" in ckpt
+    assert ckpt["config"]["class_weights"] == (0.27, 1.0, 1.55, 1.19)
 
 def test_cpu_smoke_run(synthetic_train_dataset, tmp_path):
     from vision.train import train_pipeline

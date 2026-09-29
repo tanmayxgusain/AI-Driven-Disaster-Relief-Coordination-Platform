@@ -23,7 +23,7 @@ class TrainConfig:
     max_train_samples: int = None
     max_val_samples: int = None
     label_source: str = "mask"
-    batch_size: int = 4
+    batch_size: int = 8
     num_workers: int = 2
     pin_memory: bool = True
     epochs: int = 10
@@ -35,6 +35,7 @@ class TrainConfig:
     num_classes: int = 4
     ignore_index: int = 4
     early_stopping_patience: int = 4
+    class_weights: tuple = None
 
 def set_seed(seed):
     random.seed(seed)
@@ -74,7 +75,19 @@ def create_dataloaders(config: TrainConfig):
     return train_loader, val_loader
 
 def create_loss_function(config: TrainConfig):
-    return nn.CrossEntropyLoss(ignore_index=config.ignore_index)
+    if config.class_weights is None:
+        return nn.CrossEntropyLoss(ignore_index=config.ignore_index)
+        
+    weights = config.class_weights
+    if len(weights) != 4:
+        raise ValueError(f"class_weights must have exactly 4 values, got {len(weights)}")
+        
+    for w in weights:
+        if not (isinstance(w, (int, float)) and np.isfinite(w) and w > 0):
+            raise ValueError(f"All class weights must be finite and > 0, got invalid weight: {w}")
+            
+    weight_tensor = torch.tensor(weights, dtype=torch.float32, device=config.device)
+    return nn.CrossEntropyLoss(weight=weight_tensor, ignore_index=config.ignore_index)
 
 def create_optimizer_and_scheduler(model: nn.Module, config: TrainConfig):
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
@@ -143,6 +156,14 @@ def train_pipeline(config: TrainConfig, resume_checkpoint: str = None):
     
     model = SiameseUNet(in_channels=3, num_classes=config.num_classes).to(config.device)
     criterion = create_loss_function(config)
+    
+    if config.class_weights is None:
+        print("Loss: CrossEntropyLoss")
+        print("Class weights: none")
+    else:
+        print("Loss: Weighted CrossEntropyLoss")
+        print(f"Class weights: {list(config.class_weights)}")
+        
     optimizer, scheduler = create_optimizer_and_scheduler(model, config)
     
     scaler = torch.amp.GradScaler(device=config.device) if config.device == "cuda" else None
